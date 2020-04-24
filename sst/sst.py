@@ -3,10 +3,10 @@ import os.path
 from sklearn.neighbors import KDTree
 import torch
 import torch.optim as optim
-from allennlp.data.dataset_readers.stanford_sentiment_tree_bank import \
-    StanfordSentimentTreeBankDatasetReader
-from allennlp.data.iterators import BucketIterator, BasicIterator
+from allennlp.data.dataloader import DataLoader
 from allennlp.data.vocabulary import Vocabulary
+from allennlp.data.samplers import BasicBatchSampler, BucketBatchSampler, SequentialSampler
+from allennlp.data.dataset_readers.dataset_reader import AllennlpDataset
 from allennlp.models import Model
 from allennlp.modules.seq2vec_encoders import PytorchSeq2VecWrapper
 from allennlp.modules.text_field_embedders import BasicTextFieldEmbedder
@@ -14,12 +14,16 @@ from allennlp.modules.token_embedders.embedding import _read_pretrained_embeddin
 from allennlp.modules.token_embedders import Embedding
 from allennlp.nn.util import get_text_field_mask
 from allennlp.training.metrics import CategoricalAccuracy
-from allennlp.training.trainer import Trainer
-from allennlp.common.util import lazy_groups_of
+from allennlp.training.trainer import GradientDescentTrainer
 from allennlp.data.token_indexers import SingleIdTokenIndexer
+
+from stanford_sentiment_tree_bank import StanfordSentimentTreeBankDatasetReader
 sys.path.append('..')
 import utils
 import attacks
+
+EMBEDDING_TYPE = "w2v"  # what type of word embeddings to use
+
 
 # Simple LSTM classifier that uses the final hidden state to classify Sentiment. Based on AllenNLP
 class LstmClassifier(Model):
@@ -46,11 +50,10 @@ class LstmClassifier(Model):
     def get_metrics(self, reset=False):
         return {'accuracy': self.accuracy.get_metric(reset)}
 
-EMBEDDING_TYPE = "w2v" # what type of word embeddings to use
 
 def main():
     # load the binary SST dataset.
-    single_id_indexer = SingleIdTokenIndexer(lowercase_tokens=True) # word tokenizer
+    single_id_indexer = SingleIdTokenIndexer(lowercase_tokens=True)  # word tokenizer
     # use_subtrees gives us a bit of extra data by breaking down each example into sub sentences.
     reader = StanfordSentimentTreeBankDatasetReader(granularity="2-class",
                                                     token_indexers={"tokens": single_id_indexer},
@@ -62,6 +65,8 @@ def main():
     # test_dataset = reader.read('data/sst/test.txt')
 
     vocab = Vocabulary.from_instances(train_data)
+    train_data.index_with(vocab)
+    dev_data.index_with(vocab)
 
     # Randomly initialize vectors
     if EMBEDDING_TYPE == "None":
@@ -101,32 +106,28 @@ def main():
             model.load_state_dict(torch.load(f))
     # otherwise train model from scratch and save its weights
     else:
-        iterator = BucketIterator(batch_size=32, sorting_keys=[("tokens", "num_tokens")])
-        iterator.index_with(vocab)
+        train_sampler = BucketBatchSampler(train_data, batch_size=32, sorting_keys=[("tokens")])
+        dev_sampler = BucketBatchSampler(dev_data, batch_size=32, sorting_keys=[("tokens")])
+        train_loader = DataLoader(train_data, batch_sampler=train_sampler)
+        dev_loader = DataLoader(dev_data, batch_sampler=dev_sampler)
         optimizer = optim.Adam(model.parameters())
-        trainer = Trainer(model=model,
-                          optimizer=optimizer,
-                          iterator=iterator,
-                          train_dataset=train_data,
-                          validation_dataset=dev_data,
-                          num_epochs=5,
-                          patience=1,
-                          cuda_device=0)
+        trainer = GradientDescentTrainer(model=model,
+                                         optimizer=optimizer,
+                                         data_loader=train_loader,
+                                         validation_data_loader=dev_loader,
+                                         num_epochs=5,
+                                         patience=1,
+                                         cuda_device=0)
         trainer.train()
         with open(model_path, 'wb') as f:
             torch.save(model.state_dict(), f)
         vocab.save_to_files(vocab_path)
-    model.train().cuda() # rnn cannot do backwards in train mode
+    model.train().cuda()  # rnn cannot do backwards in eval mode
 
     # Register a gradient hook on the embeddings. This saves the gradient w.r.t. the word embeddings.
     # We use the gradient later in the attack.
     utils.add_hooks(model)
-    embedding_weight = utils.get_embedding_weight(model) # also save the word embedding matrix
-
-    # Use batches of size universal_perturb_batch_size for the attacks.
-    universal_perturb_batch_size = 128
-    iterator = BasicIterator(batch_size=universal_perturb_batch_size)
-    iterator.index_with(vocab)
+    embedding_weight = utils.get_embedding_weight(model)  # also save the word embedding matrix
 
     # Build k-d Tree if you are using gradient + nearest neighbor attack
     # tree = KDTree(embedding_weight.numpy())
@@ -138,49 +139,58 @@ def main():
     for instance in dev_data:
         if instance['label'].label == dataset_label_filter:
             targeted_dev_data.append(instance)
+    targeted_dev_data = AllennlpDataset(targeted_dev_data, vocab)
 
     # get accuracy before adding triggers
     utils.get_accuracy(model, targeted_dev_data, vocab, trigger_token_ids=None)
-    model.train() # rnn cannot do backwards in train mode
+    model.train()  # rnn cannot do backwards in eval mode
 
     # initialize triggers which are concatenated to the input
     num_trigger_tokens = 3
     trigger_token_ids = [vocab.get_token_index("the")] * num_trigger_tokens
 
+    # Use batches of size universal_perturb_batch_size for the attacks.
+    universal_perturb_batch_size = 128
+    targeted_sampler = BasicBatchSampler(sampler=SequentialSampler(targeted_dev_data),
+                                         batch_size=universal_perturb_batch_size,
+                                         drop_last=False)  # TODO don't drop last
+    targeted_loader = DataLoader(targeted_dev_data, batch_sampler=targeted_sampler)
     # sample batches, update the triggers, and repeat
-    for batch in lazy_groups_of(iterator(targeted_dev_data, num_epochs=5, shuffle=True), group_size=1):
-        # get accuracy with current triggers
-        utils.get_accuracy(model, targeted_dev_data, vocab, trigger_token_ids)
-        model.train() # rnn cannot do backwards in train mode
+    for epoch in range(5):
+        for batch in targeted_loader:
+            # get accuracy with current triggers
+            utils.get_accuracy(model, targeted_dev_data, vocab, trigger_token_ids)
+            model.train()  # rnn cannot do backwards in eval mode
 
-        # get gradient w.r.t. trigger embeddings for current batch
-        averaged_grad = utils.get_average_grad(model, batch, trigger_token_ids)
+            # get gradient w.r.t. trigger embeddings for current batch
+            averaged_grad = utils.get_average_grad(model, batch, trigger_token_ids)
 
-        # pass the gradients to a particular attack to generate token candidates for each token.
-        cand_trigger_token_ids = attacks.hotflip_attack(averaged_grad,
-                                                        embedding_weight,
-                                                        trigger_token_ids,
-                                                        num_candidates=40,
-                                                        increase_loss=True)
-        # cand_trigger_token_ids = attacks.random_attack(embedding_weight,
-        #                                                trigger_token_ids,
-        #                                                num_candidates=40)
-        # cand_trigger_token_ids = attacks.nearest_neighbor_grad(averaged_grad,
-        #                                                        embedding_weight,
-        #                                                        trigger_token_ids,
-        #                                                        tree,
-        #                                                        100,
-        #                                                        num_candidates=40,
-        #                                                        increase_loss=True)
+            # pass the gradients to a particular attack to generate token candidates for each token.
+            cand_trigger_token_ids = attacks.hotflip_attack(averaged_grad,
+                                                            embedding_weight,
+                                                            trigger_token_ids,
+                                                            num_candidates=40,
+                                                            increase_loss=True)
+            # cand_trigger_token_ids = attacks.random_attack(embedding_weight,
+            #                                                trigger_token_ids,
+            #                                                num_candidates=40)
+            # cand_trigger_token_ids = attacks.nearest_neighbor_grad(averaged_grad,
+            #                                                        embedding_weight,
+            #                                                        trigger_token_ids,
+            #                                                        tree,
+            #                                                        100,
+            #                                                        num_candidates=40,
+            #                                                        increase_loss=True)
 
-        # Tries all of the candidates and returns the trigger sequence with highest loss.
-        trigger_token_ids = utils.get_best_candidates(model,
-                                                      batch,
-                                                      trigger_token_ids,
-                                                      cand_trigger_token_ids)
+            # Tries all of the candidates and returns the trigger sequence with highest loss.
+            trigger_token_ids = utils.get_best_candidates(model,
+                                                          batch,
+                                                          trigger_token_ids,
+                                                          cand_trigger_token_ids)
 
     # print accuracy after adding triggers
     utils.get_accuracy(model, targeted_dev_data, vocab, trigger_token_ids)
+
 
 if __name__ == '__main__':
     main()
